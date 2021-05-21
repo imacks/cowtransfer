@@ -3,34 +3,38 @@ package cowtransfer
 import (
 	"encoding/json"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"net/http"
 	"regexp"
-	"time"
 	"strconv"
+	"time"
 )
 
 const (
-	downloadDetailsURL = "https://cowtransfer.com/transfer/transferdetail?url=%s&treceive=undefined&passcode=%s"
-	downloadConfigURL  = "https://cowtransfer.com/transfer/download?guid=%s"
+	downloadDetailsURL = "%s/transfer/transferdetail?url=%s&treceive=undefined&passcode=%s"
+	downloadConfigURL  = "%s/transfer/download?guid=%s"
+	downloadFilesURL   = "%s/transfer/files?page=%d&guid=%s"
 )
 
-var regex = regexp.MustCompile("[0-9a-f]{14}")
-
-// CowFileInfo represents information about a file
-type CowFileInfo struct {
+// FileInfo represents information about a remote file.
+type FileInfo struct {
 	FileName string `json:"fileName"`
 	Size     int64  `json:"size"`
 	URL      string `json:"url"`
 	Error    error  `json:"error"`
 }
 
+// downloadDetailsResponse is expected response from downloadDetailsURL API.
 type downloadDetailsResponse struct {
 	GUID         string                 `json:"guid"`
 	DownloadName string                 `json:"downloadName"`
 	Deleted      bool                   `json:"deleted"`
 	Uploaded     bool                   `json:"uploaded"`
-	Details      []downloadDetailsBlock `json:"transferFileDtos"`
+}
+
+type downloadFilesResponse struct {
+	Details []downloadDetailsBlock `json:"transferFileDtos"`
+	Pages   int64                  `json:"totalPages"`
 }
 
 type downloadDetailsBlock struct {
@@ -39,82 +43,97 @@ type downloadDetailsBlock struct {
 	Size     string `json:"size"`
 }
 
+// downloadConfigResponse is expected response from downloadConfigURL API.
 type downloadConfigResponse struct {
 	Link string `json:"link"`
 }
 
-// Files return information on all files in a download link
-func (cc *CowClient) Files(link string) ([]CowFileInfo, error) {
-	fileID := regex.FindString(link)
+var fileIDRegex = regexp.MustCompile("[0-9a-f]{14}")
+
+// Files return information on all files in a download link.
+func (cc *CowClient) Files(url string) ([]FileInfo, error) {
+	fileID := fileIDRegex.FindString(url)
 	if fileID == "" {
-		return nil, fmt.Errorf("unknown download code format")
+		return nil, ErrDownloadURL
 	}
 
-	detailsURL := fmt.Sprintf(downloadDetailsURL, fileID, cc.Password)
-	response, err := http.Get(detailsURL)
+	detailsURL := fmt.Sprintf(downloadDetailsURL, cc.APIURL, fileID, cc.Password)
+	responseBytes, err := cc.newFileDownloadRequest(detailsURL, fileID)
 	if err != nil {
 		return nil, err
 	}
 
-	req, err := http.NewRequest("GET", detailsURL, nil)
+	allFiles := new(downloadDetailsResponse)
+	if err := json.Unmarshal(responseBytes, allFiles); err != nil {
+		return nil, err
+	}
+
+	if allFiles.GUID == "" {
+		return nil, ErrDownloadNotFound
+	} else if allFiles.Deleted {
+		return nil, ErrDownloadDeleted
+	} else if !allFiles.Uploaded {
+		return nil, ErrUploadInProgress
+	}
+
+	pageInfo, err := cc.getFilesByPage(0, allFiles.GUID, fileID)
 	if err != nil {
 		return nil, err
 	}
-	req.Header.Set("Referer", fmt.Sprintf("https://cowtransfer.com/s/%s", fileID))
-	req.Header.Set("Cookie", fmt.Sprintf("cf-cs-k-20181214=%d;", time.Now().UnixNano()))
-	response, err = http.DefaultClient.Do(req)
-	if err != nil { 
-		return nil, err
+
+	if pageInfo.Pages > 1 {
+		for i := 0; i < int(pageInfo.Pages); i++ {
+			more, err := cc.getFilesByPage(i, allFiles.GUID, fileID)
+			if err != nil {
+				return nil, err
+			}
+			pageInfo.Details = append(pageInfo.Details, more.Details...)
+		}
 	}
 
-	body, err := ioutil.ReadAll(response.Body)
-	if err != nil {
-		return nil, err
-	}
-	_ = response.Body.Close()
-
-	details := new(downloadDetailsResponse)
-	if err := json.Unmarshal(body, details); err != nil {
-		fmt.Printf("fsd %s\n", string(body))
-		return nil, err
-	}
-
-	if details.GUID == "" {
-		return nil, fmt.Errorf("link invalid")
-	} else if details.Deleted {
-		return nil, fmt.Errorf("link deleted")
-	} else if !details.Uploaded {
-		return nil, fmt.Errorf("link not finish upload yet")
-	}
-
-	result := []CowFileInfo{}
-	for _, item := range details.Details {
-		cowfi := cc.getItemDownloadURL(item)
+	result := []FileInfo{}
+	for _, item := range pageInfo.Details {
+		cowfi := cc.getFileURL(&item)
 		result = append(result, cowfi)
 	}
 
 	return result, nil
 }
 
-func (cc *CowClient) getItemDownloadURL(item downloadDetailsBlock) CowFileInfo {
-	result := CowFileInfo{
+func (cc *CowClient) getFilesByPage(page int, guid, fileID string) (*downloadFilesResponse, error) {
+	responseBytes, err := cc.newFileDownloadRequest(fmt.Sprintf(downloadFilesURL, cc.APIURL, page, guid), fileID)
+	if err != nil {
+		return nil, err
+	}
+
+	pageInfo := new(downloadFilesResponse)
+	if err := json.Unmarshal(responseBytes, pageInfo); err != nil {
+		return nil, err
+	}
+
+	return pageInfo, nil
+}
+
+func (cc *CowClient) getFileURL(item *downloadDetailsBlock) FileInfo {
+	result := FileInfo{
 		FileName: item.FileName,
 	}
 
-	configURL := fmt.Sprintf(downloadConfigURL, item.GUID)
+	configURL := fmt.Sprintf(downloadConfigURL, cc.APIURL, item.GUID)
 	req, err := http.NewRequest("POST", configURL, nil)
 	if err != nil {
 		result.Error = err
 		return result
 	}
 
-	response, err := http.DefaultClient.Do(addHeaders(req, cc.UserAgent))
+	client := http.Client{Timeout: cc.Timeout}
+	response, err := client.Do(cc.addHeaders(req))
 	if err != nil {
 		result.Error = err
 		return result
 	}
 
-	body, err := ioutil.ReadAll(response.Body)
+	bodyBytes, err := io.ReadAll(response.Body)
 	if err != nil {
 		result.Error = err
 		return result
@@ -122,7 +141,7 @@ func (cc *CowClient) getItemDownloadURL(item downloadDetailsBlock) CowFileInfo {
 	_ = response.Body.Close()
 
 	config := new(downloadConfigResponse)
-	if err := json.Unmarshal(body, config); err != nil {
+	if err := json.Unmarshal(bodyBytes, config); err != nil {
 		result.Error = err
 		return result
 	}
@@ -137,4 +156,28 @@ func (cc *CowClient) getItemDownloadURL(item downloadDetailsBlock) CowFileInfo {
 
 	result.Size = int64(numSize * 1024)
 	return result
+}
+
+// newFileDownloadRequest is a general wrapper for download related API calls.
+func (cc *CowClient) newFileDownloadRequest(url, fileID string) ([]byte, error) {
+	client := http.Client{Timeout: cc.Timeout}
+	req, err := http.NewRequest("GET", url, nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Referer", fmt.Sprintf("%s/s/%s", cc.APIURL, fileID))
+	req.Header.Set("Cookie", fmt.Sprintf(cc.Token, "", time.Now().UnixNano()))
+
+	response, err := client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+
+	bodyBytes, err := io.ReadAll(response.Body)
+	if err != nil {
+		return nil, err
+	}	
+	_ = response.Body.Close()
+
+	return bodyBytes, nil
 }
